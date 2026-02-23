@@ -104,16 +104,48 @@ impl DB {
         // Configure parallelism (background jobs and thread pools)
         db_opts.increase_parallelism(parallelism);
 
+        // Allow RocksDB to split a single compaction into multiple parallel
+        // subcompactions, significantly speeding up full compaction on
+        // multi-core machines.
+        db_opts.set_max_subcompactions(4);
+
         // Configure write buffer size (not set by increase_parallelism)
         db_opts.set_write_buffer_size(config.db_write_buffer_size_mb * 1024 * 1024);
 
-        // db_opts.set_advise_random_on_open(???);
         db_opts.set_compaction_readahead_size(1 << 20);
 
-        // Configure block cache
+        // All key types across all three databases (txstore, history, cache)
+        // share a 1-byte type code + 32-byte hash as the first 33 bytes of
+        // their key. Setting a fixed-prefix extractor enables per-SST prefix
+        // bloom filters so range scans (wallet sync) can skip files that do
+        // not contain the target scripthash.
+        db_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
+
+        // Configure block cache — use HyperClockCache for lock-free
+        // concurrent reads. estimated_entry_charge=4096 matches the default
+        // block size for a fixed-size, fully lock-free hash table.
+        // Note: estimated_entry_charge=0 (auto-tune) causes a multi-minute
+        // hang during DB open on RocksDB 8.1.1 with large databases.
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
-        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_size_bytes));
+        block_opts.set_block_cache(&rocksdb::Cache::new_hyper_clock_cache(cache_size_bytes, 4096));
+
+        // 10-bit bloom filter per key. Combined with the prefix extractor
+        // above, this creates prefix bloom filters for range scans and
+        // whole-key bloom filters for point lookups (multi_get) on all levels.
+        block_opts.set_bloom_filter(10.0, false);
+
+        // 16KB blocks improve range scan throughput (electrs workload is
+        // dominated by range scans for address → txs/utxo lookups).
+        block_opts.set_block_size(16 * 1024);
+
+        // Use partitioned indexes and filters so only the hot partitions are
+        // loaded into table reader memory rather than multi-MB monolithic
+        // blocks per SST file. Reduces memory footprint for cold SST files.
+        block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+        block_opts.set_partition_filters(true);
+        block_opts.set_metadata_block_size(4096);
+
         db_opts.set_block_based_table_factory(&block_opts);
 
         let db = DB {
@@ -126,10 +158,15 @@ impl DB {
     }
 
     pub fn full_compaction(&self) {
-        // TODO: make sure this doesn't fail silently
+        // Force rewrite of bottommost level to ensure bloom filters are
+        // applied to all SST files, not just upper levels.
         info!("starting full compaction on {:?}", self.db);
-        self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
-        info!("finished full compaction on {:?}", self.db);
+        let start = std::time::Instant::now();
+        let mut opts = rocksdb::CompactOptions::default();
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        self.db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &opts);
+        let elapsed = start.elapsed();
+        info!("finished full compaction on {:?} in elapsed='{:.1?}'", self.db, elapsed);
     }
 
     pub fn enable_auto_compaction(&self) {
@@ -138,19 +175,34 @@ impl DB {
     }
 
     pub fn raw_iterator(&self) -> rocksdb::DBRawIterator {
-        self.db.raw_iterator()
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        self.db.raw_iterator_opt(opts)
     }
 
     pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator {
+        // When a prefix extractor is configured (fixed 33-byte prefix), scans
+        // with shorter prefixes must use total-order seek to avoid incorrectly
+        // skipping SST files whose keys are outside the prefix extractor domain.
+        let iter = if prefix.len() >= 33 {
+            self.db.prefix_iterator(prefix)
+        } else {
+            let mut opts = rocksdb::ReadOptions::default();
+            opts.set_total_order_seek(true);
+            self.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+                opts,
+            )
+        };
         ScanIterator {
             prefix: prefix.to_vec(),
-            iter: self.db.prefix_iterator(prefix),
+            iter,
             done: false,
         }
     }
 
     pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator {
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+        let iter = self.db.full_iterator(rocksdb::IteratorMode::From(
             start_at,
             rocksdb::Direction::Forward,
         ));
@@ -162,7 +214,9 @@ impl DB {
     }
 
     pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator {
-        let mut iter = self.db.raw_iterator();
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_total_order_seek(true);
+        let mut iter = self.db.raw_iterator_opt(opts);
         iter.seek_for_prev(prefix_max);
 
         ReverseScanIterator {
@@ -209,7 +263,11 @@ impl DB {
     }
 
     pub fn flush(&self) {
+        info!("starting flush on {:?}", self.db);
+        let start = std::time::Instant::now();
         self.db.flush().unwrap();
+        let elapsed = start.elapsed();
+        info!("finished flush on {:?} in elapsed='{:.1?}'", self.db, elapsed);
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {

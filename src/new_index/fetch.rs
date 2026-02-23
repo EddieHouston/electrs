@@ -79,7 +79,7 @@ fn bitcoind_fetcher(
         debug!("{:?} ({} left to index)", tip, new_headers.len());
     };
     let daemon = daemon.reconnect()?;
-    let chan = SyncChannel::new(1);
+    let chan = SyncChannel::new(4);
     let sender = chan.sender();
     Ok(Fetcher::from(
         chan.into_receiver(),
@@ -131,7 +131,7 @@ fn blkfiles_fetcher(
     let blk_files = daemon.list_blk_files()?;
     let xor_key = daemon.read_blk_file_xor_key()?;
 
-    let chan = SyncChannel::new(1);
+    let chan = SyncChannel::new(4);
     let sender = chan.sender();
 
     let mut entry_map: HashMap<BlockHash, HeaderEntry> =
@@ -180,7 +180,7 @@ fn blkfiles_fetcher(
 
 #[trace]
 fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher<Vec<u8>> {
-    let chan = SyncChannel::new(1);
+    let chan = SyncChannel::new(4);
     let sender = chan.sender();
 
     Fetcher::from(
@@ -218,7 +218,7 @@ fn blkfile_apply_xor_key(xor_key: [u8; 8], blob: &mut [u8]) {
 
 #[trace]
 fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBlock>> {
-    let chan = SyncChannel::new(1);
+    let chan = SyncChannel::new(4);
     let sender = chan.sender();
 
     Fetcher::from(

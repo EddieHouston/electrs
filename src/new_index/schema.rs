@@ -271,9 +271,12 @@ impl Indexer {
     fn start_auto_compactions(&self, db: &DB) {
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
+            info!("compaction flag not found, triggering full compaction");
             db.full_compaction();
             db.put_sync(&key, b"");
             assert!(db.get(&key).is_some());
+        } else {
+            info!("compaction flag found, skipping full compaction");
         }
         db.enable_auto_compaction();
     }
@@ -345,6 +348,7 @@ impl Indexer {
         let mut blocks_fetched = 0;
         let to_add_total = to_add.len();
 
+        let add_start = std::time::Instant::now();
         start_fetcher(self.from, &daemon, to_add)?.map(|blocks|
             {
                 if fetcher_count % 25 == 0 && to_add_total > 20 {
@@ -359,6 +363,8 @@ impl Indexer {
 
                 self.add(&blocks)
             });
+        let add_elapsed = add_start.elapsed();
+        info!("txstore add phase completed blocks_fetched='{}' elapsed='{:.1?}'", blocks_fetched, add_elapsed);
 
         self.start_auto_compactions(&self.store.txstore_db);
 
@@ -369,7 +375,10 @@ impl Indexer {
             to_index.len(),
             self.from
         );
+        let index_start = std::time::Instant::now();
         start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
+        let index_elapsed = index_start.elapsed();
+        info!("history index phase completed elapsed='{:.1?}'", index_elapsed);
         self.start_auto_compactions(&self.store.history_db);
         self.start_auto_compactions(&self.store.cache_db);
 
