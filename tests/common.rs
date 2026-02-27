@@ -296,14 +296,56 @@ impl TestRunner {
 }
 
 // Make the RpcApi methods available directly on TestRunner,
-// without having to go through the node_client() getter
-impl bitcoincore_rpc::RpcApi for TestRunner {
+// without having to go through the node_client() getter.
+// In liquid mode, implement the bitcoincore_rpc::RpcApi trait (elementsd uses it).
+// In non-liquid mode, add a plain call() method since corepc-node doesn't use RpcApi.
+#[cfg(feature = "liquid")]
+impl nclient::RpcApi for TestRunner {
     fn call<T: for<'a> serde::de::Deserialize<'a>>(
         &self,
         cmd: &str,
         args: &[serde_json::Value],
-    ) -> bitcoincore_rpc::Result<T> {
+    ) -> nclient::Result<T> {
         self.node_client().call(cmd, args)
+    }
+}
+
+#[cfg(not(feature = "liquid"))]
+impl TestRunner {
+    pub fn call<T: for<'a> serde::de::Deserialize<'a>>(
+        &self,
+        cmd: &str,
+        args: &[serde_json::Value],
+    ) -> nclient::Result<T> {
+        self.node_client().call(cmd, args)
+    }
+
+    pub fn get_raw_transaction(
+        &self,
+        txid: &Txid,
+        _block_hash: Option<&BlockHash>,
+    ) -> Result<bitcoin::Transaction> {
+        let hex: String = self.call("getrawtransaction", &[txid.to_string().into()])?;
+        use bitcoin::hex::FromHex;
+        let bytes = Vec::<u8>::from_hex(&hex).expect("valid hex transaction");
+        Ok(bitcoin::consensus::deserialize(&bytes).expect("valid transaction"))
+    }
+
+    pub fn invalidate_block(&self, block_hash: &BlockHash) -> Result<()> {
+        self.call::<serde_json::Value>("invalidateblock", &[block_hash.to_string().into()])?;
+        Ok(())
+    }
+
+    pub fn generate_to_address(&self, num_blocks: u64, addr: &Address) -> Result<Vec<BlockHash>> {
+        Ok(self.call(
+            "generatetoaddress",
+            &[serde_json::json!(num_blocks), addr.to_string().into()],
+        )?)
+    }
+
+    pub fn get_block_hash(&self, height: u64) -> Result<BlockHash> {
+        let hash_str: String = self.call("getblockhash", &[serde_json::json!(height)])?;
+        Ok(hash_str.parse().expect("valid block hash"))
     }
 }
 

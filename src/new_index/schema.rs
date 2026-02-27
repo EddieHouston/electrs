@@ -124,7 +124,7 @@ impl Store {
         &self.cache_db
     }
 
-    pub fn headers(&self) -> RwLockReadGuard<HeaderList> {
+    pub fn headers(&self) -> RwLockReadGuard<'_, HeaderList> {
         self.indexed_headers.read().unwrap()
     }
 

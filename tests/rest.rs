@@ -2,7 +2,6 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::FromHex;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::Read;
 use std::net;
 
 #[cfg(not(feature = "liquid"))]
@@ -17,7 +16,7 @@ pub mod common;
 
 use common::Result;
 
-fn get(rest_addr: net::SocketAddr, path: &str) -> std::result::Result<ureq::Response, ureq::Error> {
+fn get(rest_addr: net::SocketAddr, path: &str) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     ureq::get(&format!("http://{}{}", rest_addr, path)).call()
 }
 
@@ -319,9 +318,7 @@ fn test_rest_block() -> Result<()> {
     }
 
     // Test GET /block/:hash/raw
-    let mut res = get(rest_addr, &format!("/block/{}/raw", blockhash))?.into_reader();
-    let mut rest_rawblock = Vec::new();
-    res.read_to_end(&mut rest_rawblock).unwrap();
+    let rest_rawblock = get(rest_addr, &format!("/block/{}/raw", blockhash))?.into_body().read_to_vec()?;
     let node_hexblock = // uses low-level call() to support Elements
         tester.call::<String>("getblock", &[blockhash.to_string().into(), 0.into()])?;
     assert_eq!(rest_rawblock, Vec::from_hex(&node_hexblock).unwrap());
@@ -456,7 +453,7 @@ fn test_rest_block_status() -> Result<()> {
     let blockhash1 = tester.mine()?;
     let blockhash2 = tester.mine()?; // tip
 
-    let block_count = tester.node_client().get_block_count()?;
+    let block_count = tester.get_block_count()?;
 
     // Non-tip block should have next_best pointing to next block
     let res = get_json(rest_addr, &format!("/block/{}/status", blockhash1))?;
@@ -830,7 +827,7 @@ fn test_rest_reorg() -> Result<()> {
         )
     };
 
-    let init_height = tester.node_client().get_block_count()?;
+    let init_height = tester.get_block_count()?;
 
     let address = tester.newaddress()?;
     let miner_address = tester.newaddress()?;
