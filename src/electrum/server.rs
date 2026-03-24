@@ -789,6 +789,9 @@ impl RPC {
                 stream
                     .set_nonblocking(false)
                     .expect("failed to set connection as blocking");
+                stream
+                    .set_nodelay(true)
+                    .expect("failed to set TCP_NODELAY");
                 acceptor.send(Some((stream, addr))).expect("send failed");
             }
         });
