@@ -90,7 +90,7 @@ pub enum DBFlush {
 }
 
 impl DB {
-    pub fn open(path: &Path, config: &Config, verify_compat: bool) -> DB {
+    pub fn open(path: &Path, config: &Config, verify_compat: bool, shared_cache: &rocksdb::Cache) -> DB {
         debug!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
@@ -148,8 +148,7 @@ impl DB {
 
         // Configure block cache and table options
         let mut block_opts = rocksdb::BlockBasedOptions::default();
-        let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
-        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(cache_size_bytes));
+        block_opts.set_block_cache(shared_cache);
         // Store index and filter blocks inside the block cache so their memory is
         // bounded by --db-block-cache-mb. Without this, RocksDB allocates table-reader
         // memory (index + filter blocks) on the heap separately for every open SST file.

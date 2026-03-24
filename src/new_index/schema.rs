@@ -1,3 +1,5 @@
+use rocksdb;
+
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
@@ -61,15 +63,22 @@ impl Store {
     pub fn open(config: &Config, metrics: &Metrics, verify_compat: bool) -> Self {
         let path = config.db_path.join("newindex");
 
-        let txstore_db = DB::open(&path.join("txstore"), config, verify_compat);
+        let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
+        let shared_cache = rocksdb::Cache::new_hyper_clock_cache(cache_size_bytes, 4096);
+        info!(
+            "created shared HyperClockCache: size_mb='{}'",
+            config.db_block_cache_mb
+        );
+
+        let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config, verify_compat);
+        let history_db = DB::open(&path.join("history"), config, verify_compat, &shared_cache);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config, verify_compat);
+        let cache_db = DB::open(&path.join("cache"), config, verify_compat, &shared_cache);
 
         let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
         txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");

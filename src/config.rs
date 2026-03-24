@@ -235,7 +235,7 @@ impl Config {
             ).arg(
                 Arg::with_name("db_block_cache_mb")
                     .long("db-block-cache-mb")
-                    .help("RocksDB block cache size in MB per database. Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
+                    .help("RocksDB shared block cache size in MB (shared across all databases). Must hold filter+index metadata. Use 8192+ for initial sync.")
                     .takes_value(true)
                     .default_value("8")
             ).arg(
