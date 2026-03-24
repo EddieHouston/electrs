@@ -64,6 +64,12 @@ pub struct Config {
     /// Larger buffers = fewer flushes (less CPU) but more RAM usage
     pub db_write_buffer_size_mb: usize,
 
+    /// RocksDB compaction rate limit in MB/s (0 = unlimited)
+    /// Limits background compaction I/O to prevent saturating disk during serving.
+    /// Compaction competes with query reads for disk bandwidth; without a limit,
+    /// a large compaction backlog can cause latency spikes.
+    pub db_compaction_rate_limit_mb: usize,
+
     /// Number of blocks per batch during initial sync (bitcoind fetch mode).
     /// Larger batches keep more O rows in the write buffer when index() runs lookup_txos(),
     /// improving cache hit rate for outputs spent within the same batch window.
@@ -250,6 +256,12 @@ impl Config {
                     .help("RocksDB write buffer size in MB per database. RAM usage = size * max_write_buffers(2) * 3_databases")
                     .takes_value(true)
                     .default_value("256")
+             ).arg(
+                Arg::with_name("db_compaction_rate_limit_mb")
+                    .long("db-compaction-rate-limit-mb")
+                    .help("RocksDB compaction rate limit in MB/s. Limits background compaction I/O to prevent disk saturation during serving. 0 = unlimited.")
+                    .takes_value(true)
+                    .default_value("0")
              ).arg(
                 Arg::with_name("initial_sync_batch_size")
                     .long("initial-sync-batch-size")
@@ -495,6 +507,7 @@ impl Config {
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
+            db_compaction_rate_limit_mb: value_t_or_exit!(m, "db_compaction_rate_limit_mb", usize),
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
             zmq_addr,
 

@@ -146,6 +146,17 @@ impl DB {
         // parallelism level keeps all background threads busy during the final compaction.
         db_opts.set_max_subcompactions(parallelism as u32);
 
+        // Rate-limit background compaction I/O to prevent saturating the disk
+        // during serving. 0 = unlimited (default, appropriate for initial sync).
+        if config.db_compaction_rate_limit_mb > 0 {
+            let rate_bytes = (config.db_compaction_rate_limit_mb as i64) * 1024 * 1024;
+            db_opts.set_ratelimiter(rate_bytes, 100_000, 10);
+            info!(
+                "compaction rate limiter: mb_per_sec='{}'",
+                config.db_compaction_rate_limit_mb
+            );
+        }
+
         // Configure block cache and table options
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_block_cache(shared_cache);
