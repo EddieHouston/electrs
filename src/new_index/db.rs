@@ -186,6 +186,13 @@ impl DB {
         // skips SST files that contain matching keys. See the conditional in iter_scan().
         db_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(33));
 
+        if config.db_direct_reads {
+            db_opts.set_use_direct_reads(true);
+        }
+        if config.db_direct_io_flush_compaction {
+            db_opts.set_use_direct_io_for_flush_and_compaction(true);
+        }
+
         db_opts.set_block_based_table_factory(&block_opts);
 
         let db = DB {

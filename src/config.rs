@@ -70,6 +70,13 @@ pub struct Config {
     /// Must stay within db_write_buffer_size_mb to avoid mid-batch flushes.
     pub initial_sync_batch_size: usize,
 
+    /// Use direct I/O for RocksDB reads, bypassing the OS page cache.
+    /// Prevents double-caching (page cache + block cache).
+    pub db_direct_reads: bool,
+
+    /// Use direct I/O for RocksDB flush and compaction writes.
+    pub db_direct_io_flush_compaction: bool,
+
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
@@ -256,6 +263,18 @@ impl Config {
                     .help("Number of blocks per batch during initial sync. Larger values keep more txo rows in the write buffer during indexing, improving lookup_txos cache hit rate for recently-created outputs.")
                     .takes_value(true)
                     .default_value("250")
+             ).arg(
+                Arg::with_name("db_direct_io")
+                    .long("db-direct-io")
+                    .help("Enable direct I/O for both reads and flush/compaction, bypassing the OS page cache")
+             ).arg(
+                Arg::with_name("db_direct_reads")
+                    .long("db-direct-reads")
+                    .help("Enable direct I/O for reads only, bypassing the OS page cache")
+             ).arg(
+                Arg::with_name("db_direct_io_flush_compaction")
+                    .long("db-direct-io-flush-compaction")
+                    .help("Enable direct I/O for flush and compaction only")
              ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
@@ -496,6 +515,8 @@ impl Config {
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
+            db_direct_reads: m.is_present("db_direct_io") || m.is_present("db_direct_reads"),
+            db_direct_io_flush_compaction: m.is_present("db_direct_io") || m.is_present("db_direct_io_flush_compaction"),
             zmq_addr,
 
             #[cfg(feature = "liquid")]

@@ -121,6 +121,8 @@ impl TestRunner {
             db_parallelism: 2,
             db_write_buffer_size_mb: 256,
             initial_sync_batch_size: 250,
+            db_direct_reads: false,
+            db_direct_io_flush_compaction: false,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
