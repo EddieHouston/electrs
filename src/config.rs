@@ -77,6 +77,11 @@ pub struct Config {
     /// Use direct I/O for RocksDB flush and compaction writes.
     pub db_direct_io_flush_compaction: bool,
 
+    /// Store index and filter blocks inside the block cache (default: true).
+    /// Bounds memory but allows eviction under pressure. On spinning disks,
+    /// set to false so index/filter blocks stay on the heap and are never evicted.
+    pub db_cache_index_filter_blocks: bool,
+
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
     #[cfg(feature = "liquid")]
@@ -275,6 +280,10 @@ impl Config {
                 Arg::with_name("db_direct_io_flush_compaction")
                     .long("db-direct-io-flush-compaction")
                     .help("Enable direct I/O for flush and compaction only")
+             ).arg(
+                Arg::with_name("no_cache_index_filter_blocks")
+                    .long("no-cache-index-filter-blocks")
+                    .help("Keep index/filter blocks on the heap instead of in the block cache. Prevents eviction on spinning disks at the cost of unbounded memory.")
              ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
@@ -517,6 +526,7 @@ impl Config {
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
             db_direct_reads: m.is_present("db_direct_io") || m.is_present("db_direct_reads"),
             db_direct_io_flush_compaction: m.is_present("db_direct_io") || m.is_present("db_direct_io_flush_compaction"),
+            db_cache_index_filter_blocks: !m.is_present("no_cache_index_filter_blocks"),
             zmq_addr,
 
             #[cfg(feature = "liquid")]

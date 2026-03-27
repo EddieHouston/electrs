@@ -123,6 +123,7 @@ impl TestRunner {
             initial_sync_batch_size: 250,
             db_direct_reads: false,
             db_direct_io_flush_compaction: false,
+            db_cache_index_filter_blocks: true,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]

@@ -157,13 +157,15 @@ impl DB {
         // default) and this unbounded heap allocation can grow to many GB.
         // Note: increase --db-block-cache-mb proportionally (e.g. 4096) so the cache is
         // large enough to hold the working set of filter/index blocks without thrashing.
-        block_opts.set_cache_index_and_filter_blocks(true);
-        // Pin L0 index and filter blocks in the cache so they are never evicted.
-        // Without this, data block churn evicts L0 index/filter blocks, causing
-        // repeated disk reads for every SST lookup — worse than the old heap approach.
-        // With this, L0 index/filter blocks behave like the old table-reader heap
-        // allocation but stay within the bounded block cache.
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        if config.db_cache_index_filter_blocks {
+            block_opts.set_cache_index_and_filter_blocks(true);
+            // Pin L0 index and filter blocks in the cache so they are never evicted.
+            // Without this, data block churn evicts L0 index/filter blocks, causing
+            // repeated disk reads for every SST lookup — worse than the old heap approach.
+            // With this, L0 index/filter blocks behave like the old table-reader heap
+            // allocation but stay within the bounded block cache.
+            block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        }
         // Bloom filters allow multi_get() to skip SST files that don't contain a key
         // without touching the index or data blocks. Without this, every point lookup
         // must binary-search the index of every L0 file whose key range overlaps the
