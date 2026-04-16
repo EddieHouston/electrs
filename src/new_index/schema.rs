@@ -3,8 +3,7 @@ use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
+use sha2::{Digest, Sha256};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -1438,11 +1437,9 @@ fn addr_search_filter(prefix: &str) -> Bytes {
 pub type FullHash = [u8; 32]; // serialized SHA256 result
 
 pub fn compute_script_hash(script: &Script) -> FullHash {
-    let mut hash = FullHash::default();
-    let mut sha2 = Sha256::new();
-    sha2.input(script.as_bytes());
-    sha2.result(&mut hash);
-    hash
+    let mut hasher = Sha256::new();
+    hasher.update(script.as_bytes());
+    hasher.finalize().into()
 }
 
 pub fn parse_hash(hash: &FullHash) -> Sha256dHash {

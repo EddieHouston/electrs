@@ -8,8 +8,7 @@ use std::time::Instant;
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hex::DisplayHex;
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
+use sha2::{Digest, Sha256};
 use error_chain::ChainedError;
 use serde_json::{from_str, Value};
 
@@ -76,8 +75,7 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
     if txs.is_empty() {
         None
     } else {
-        let mut hash = FullHash::default();
-        let mut sha2 = Sha256::new();
+        let mut hasher = Sha256::new();
         for (txid, blockid) in txs {
             let is_mempool = blockid.is_none();
             let has_unconfirmed_parents = is_mempool
@@ -85,10 +83,9 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
                 .unwrap_or(false);
             let height = get_electrum_height(blockid, has_unconfirmed_parents);
             let part = format!("{}:{}:", txid, height);
-            sha2.input(part.as_bytes());
+            hasher.update(part.as_bytes());
         }
-        sha2.result(&mut hash);
-        Some(hash)
+        Some(hasher.finalize().into())
     }
 }
 
@@ -529,9 +526,9 @@ impl Connection {
 
     fn hash_ip_with_salt(&self, ip: &str) -> String {
         let mut hasher = Sha256::new();
-        hasher.input(self.salt.as_bytes());
-        hasher.input(ip.as_bytes());
-        hasher.result_str()
+        hasher.update(self.salt.as_bytes());
+        hasher.update(ip.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
     fn log_rpc_event(&self, mut log: Value) {

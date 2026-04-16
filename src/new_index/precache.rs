@@ -3,8 +3,7 @@ use crate::errors::*;
 use crate::new_index::ChainQuery;
 use crate::util::FullHash;
 
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
+use sha2::{Digest, Sha256};
 use rayon::prelude::*;
 
 use bitcoin::hex::FromHex;
@@ -74,9 +73,7 @@ fn address_to_scripthash(addr: &str) -> Result<FullHash> {
 }
 
 pub fn compute_script_hash(data: &[u8]) -> FullHash {
-    let mut hash = FullHash::default();
-    let mut sha2 = Sha256::new();
-    sha2.input(data);
-    sha2.result(&mut hash);
-    hash
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
