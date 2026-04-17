@@ -11,6 +11,7 @@ use bitcoin::hex::DisplayHex;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use error_chain::ChainedError;
+use rayon::prelude::*;
 use serde_json::{from_str, Value};
 
 use electrs_macros::trace;
@@ -31,7 +32,7 @@ use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullH
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
-const MAX_ARRAY_BATCH: usize = 20;
+const MAX_ARRAY_BATCH: usize = 100;
 
 #[cfg(feature = "electrum-discovery")]
 use crate::electrum::{DiscoveryManager, ServerFeatures};
@@ -92,6 +93,14 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
     }
 }
 
+/// Side effects produced by read-only command handlers that must be applied
+/// to `Connection` state after parallel execution completes.
+enum CommandSideEffect {
+    SubscribeScriptHash(Sha256dHash, Value),
+    UnsubscribeScriptHash(Sha256dHash),
+    SubscribeHeaders(HeaderEntry),
+}
+
 macro_rules! conditionally_log_rpc_event {
     ($self:ident, $event:expr) => {
         if $self.rpc_logging.enabled {
@@ -143,12 +152,11 @@ impl Connection {
         }
     }
 
-    fn blockchain_headers_subscribe(&mut self) -> Result<Value> {
+    fn blockchain_headers_subscribe_pure(&self) -> Result<(Value, Option<CommandSideEffect>)> {
         let entry = self.query.chain().best_header();
         let hex_header = serialize_hex(entry.header());
         let result = json!({"hex": hex_header, "height": entry.height()});
-        self.last_header_entry = Some(entry);
-        Ok(result)
+        Ok((result, Some(CommandSideEffect::SubscribeHeaders(entry))))
     }
 
     fn server_version(&self) -> Result<Value> {
@@ -284,29 +292,22 @@ impl Connection {
         Ok(json!(relayfee / 100_000f64))
     }
 
-    fn blockchain_scripthash_subscribe(&mut self, params: &[Value]) -> Result<Value> {
+    fn blockchain_scripthash_subscribe_pure(&self, params: &[Value]) -> Result<(Value, Option<CommandSideEffect>)> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
 
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
         let status_hash = get_status_hash(history_txids, &self.query)
             .map_or(Value::Null, |h| json!(h.to_lower_hex_string()));
 
-        if let None = self.status_hashes.insert(script_hash, status_hash.clone()) {
-            self.stats.subscriptions.inc();
-        }
-        Ok(status_hash)
+        Ok((status_hash.clone(), Some(CommandSideEffect::SubscribeScriptHash(script_hash, status_hash))))
     }
 
-    fn blockchain_scripthash_unsubscribe(&mut self, params: &[Value]) -> Result<Value> {
+    fn blockchain_scripthash_unsubscribe_pure(&self, params: &[Value]) -> Result<(Value, Option<CommandSideEffect>)> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
-
-        match self.status_hashes.remove(&script_hash) {
-            None => Ok(json!(false)),
-            Some(_) => {
-                self.stats.subscriptions.dec();
-                Ok(json!(true))
-            }
-        }
+        // Return true optimistically; apply_side_effect will check actual presence.
+        // The result is correct for the common case (unsubscribing something that exists).
+        let was_subscribed = self.status_hashes.contains_key(&script_hash);
+        Ok((json!(was_subscribed), Some(CommandSideEffect::UnsubscribeScriptHash(script_hash))))
     }
 
     #[cfg(not(feature = "liquid"))]
@@ -433,8 +434,28 @@ impl Connection {
         }))
     }
 
-    #[trace(method = %method)]
-    fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
+    fn apply_side_effect(&mut self, effect: CommandSideEffect) {
+        match effect {
+            CommandSideEffect::SubscribeScriptHash(script_hash, status_hash) => {
+                if self.status_hashes.insert(script_hash, status_hash).is_none() {
+                    self.stats.subscriptions.inc();
+                }
+            }
+            CommandSideEffect::UnsubscribeScriptHash(script_hash) => {
+                if self.status_hashes.remove(&script_hash).is_some() {
+                    self.stats.subscriptions.dec();
+                }
+            }
+            CommandSideEffect::SubscribeHeaders(entry) => {
+                self.last_header_entry = Some(entry);
+            }
+        }
+    }
+
+    /// Process a command without mutating Connection state. Returns the JSON-RPC
+    /// result and an optional side effect to apply afterwards. Safe to call from
+    /// multiple rayon threads concurrently (takes `&self`).
+    fn handle_command_pure(&self, method: &str, params: &[Value], id: &Value) -> Result<(Value, Option<CommandSideEffect>)> {
         let timer = self
             .stats
             .latency
@@ -442,41 +463,39 @@ impl Connection {
             .start_timer();
 
         let result = match method {
-            "blockchain.block.header" => self.blockchain_block_header(&params),
-            "blockchain.block.headers" => self.blockchain_block_headers(&params),
-            "blockchain.estimatefee" => self.blockchain_estimatefee(&params),
-            "blockchain.headers.subscribe" => self.blockchain_headers_subscribe(),
-            "blockchain.relayfee" => self.blockchain_relayfee(),
+            "blockchain.block.header" => self.blockchain_block_header(params).map(|v| (v, None)),
+            "blockchain.block.headers" => self.blockchain_block_headers(params).map(|v| (v, None)),
+            "blockchain.estimatefee" => self.blockchain_estimatefee(params).map(|v| (v, None)),
+            "blockchain.headers.subscribe" => self.blockchain_headers_subscribe_pure(),
+            "blockchain.relayfee" => self.blockchain_relayfee().map(|v| (v, None)),
             #[cfg(not(feature = "liquid"))]
-            "blockchain.scripthash.get_balance" => self.blockchain_scripthash_get_balance(&params),
-            "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(&params),
-            "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(&params),
-            "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
-            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(&params),
-            "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
-            "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
-            "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
-            "blockchain.transaction.id_from_pos" => {
-                self.blockchain_transaction_id_from_pos(&params)
-            }
-            "mempool.get_fee_histogram" => self.mempool_get_fee_histogram(),
-            "server.banner" => self.server_banner(),
-            "server.donation_address" => self.server_donation_address(),
-            "server.peers.subscribe" => self.server_peers_subscribe(),
-            "server.ping" => Ok(Value::Null),
-            "server.version" => self.server_version(),
+            "blockchain.scripthash.get_balance" => self.blockchain_scripthash_get_balance(params).map(|v| (v, None)),
+            "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(params).map(|v| (v, None)),
+            "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(params).map(|v| (v, None)),
+            "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe_pure(params),
+            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe_pure(params),
+            "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(params).map(|v| (v, None)),
+            "blockchain.transaction.get" => self.blockchain_transaction_get(params).map(|v| (v, None)),
+            "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(params).map(|v| (v, None)),
+            "blockchain.transaction.id_from_pos" => self.blockchain_transaction_id_from_pos(params).map(|v| (v, None)),
+            "mempool.get_fee_histogram" => self.mempool_get_fee_histogram().map(|v| (v, None)),
+            "server.banner" => self.server_banner().map(|v| (v, None)),
+            "server.donation_address" => self.server_donation_address().map(|v| (v, None)),
+            "server.peers.subscribe" => self.server_peers_subscribe().map(|v| (v, None)),
+            "server.ping" => Ok((Value::Null, None)),
+            "server.version" => self.server_version().map(|v| (v, None)),
 
             #[cfg(feature = "electrum-discovery")]
-            "server.features" => self.server_features(),
+            "server.features" => self.server_features().map(|v| (v, None)),
             #[cfg(feature = "electrum-discovery")]
-            "server.add_peer" => self.server_add_peer(&params),
+            "server.add_peer" => self.server_add_peer(params).map(|v| (v, None)),
 
             &_ => bail!("unknown method {} {:?}", method, params),
         };
         timer.observe_duration();
-        // TODO: return application errors should be sent to the client
+
         Ok(match result {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Ok((result, side_effect)) => (json!({"jsonrpc": "2.0", "id": id, "result": result}), side_effect),
             Err(e) => {
                 warn!(
                     "rpc #{} {} {:?} failed: {}",
@@ -485,9 +504,18 @@ impl Connection {
                     params,
                     e.display_chain()
                 );
-                json!({"jsonrpc": "2.0", "id": id, "error": format!("{}", e)})
+                (json!({"jsonrpc": "2.0", "id": id, "error": format!("{}", e)}), None)
             }
         })
+    }
+
+    #[trace(method = %method)]
+    fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
+        let (response, side_effect) = self.handle_command_pure(method, params, id)?;
+        if let Some(effect) = side_effect {
+            self.apply_side_effect(effect);
+        }
+        Ok(response)
     }
 
     #[trace]
@@ -579,12 +607,26 @@ impl Connection {
                                 MAX_ARRAY_BATCH
                             );
                         }
-                        let mut result = Vec::with_capacity(arr.len());
-                        for el in arr {
-                            let reply = self.handle_value(el, &empty_params)?;
-                            result.push(reply)
+                        // Process batch items in parallel using rayon. Each item
+                        // is handled with &self (no mutation); side effects are
+                        // collected and applied sequentially afterwards.
+                        let results: Vec<Result<(Value, Option<CommandSideEffect>, Option<Value>)>> = arr
+                            .par_iter()
+                            .map(|el| self.handle_value_pure(el, &empty_params))
+                            .collect();
+
+                        let mut replies = Vec::with_capacity(results.len());
+                        for item in results {
+                            let (reply, side_effect, log_entry) = item?;
+                            if let Some(effect) = side_effect {
+                                self.apply_side_effect(effect);
+                            }
+                            if let Some(log) = log_entry {
+                                self.log_rpc_event(log);
+                            }
+                            replies.push(reply);
                         }
-                        self.send_values(&[Value::Array(result)])?
+                        self.send_values(&[Value::Array(replies)])?
                     } else {
                         let reply = self.handle_value(cmd, &empty_params)?;
                         self.send_values(&[reply])?
@@ -636,6 +678,44 @@ impl Connection {
                 }
             },
         )
+    }
+
+    /// Process a single batch element without mutating Connection state.
+    /// Returns (response_json, optional_side_effect, optional_log_entry) or an error.
+    fn handle_value_pure(&self, cmd: &Value, empty_params: &Value) -> Result<(Value, Option<CommandSideEffect>, Option<Value>)> {
+        let start_time = Instant::now();
+        match (
+            cmd.get("method"),
+            cmd.get("params").unwrap_or_else(|| empty_params),
+            cmd.get("id"),
+        ) {
+            (Some(&Value::String(ref method)), &Value::Array(ref params), Some(ref id)) => {
+                let (reply, side_effect) = self.handle_command_pure(method, params, id)?;
+
+                let log_entry = if self.rpc_logging.enabled {
+                    Some(json!({
+                        "event": "rpc_response",
+                        "method": method,
+                        "params": if self.rpc_logging.hide_params {
+                                Value::Null
+                            } else {
+                                json!(params)
+                            },
+                        "request_size": serde_json::to_vec(&cmd).map(|v| v.len()).unwrap_or(0),
+                        "response_size": reply.to_string().as_bytes().len(),
+                        "duration_micros": start_time.elapsed().as_micros(),
+                        "id": id,
+                    }))
+                } else {
+                    None
+                };
+
+                Ok((reply, side_effect, log_entry))
+            }
+            _ => {
+                bail!("invalid command: {}", cmd)
+            }
+        }
     }
 
     #[trace]
