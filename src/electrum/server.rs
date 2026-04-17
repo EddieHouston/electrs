@@ -19,12 +19,12 @@ use electrs_macros::trace;
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
 use elements::encode::serialize_hex;
-use crate::chain::Txid;
+use crate::chain::{deserialize, Transaction, Txid};
 use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
-use crate::new_index::{Query, Utxo};
+use crate::new_index::{compute_script_hash, Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{create_socket, full_hash, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
 
@@ -68,6 +68,24 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
         return Ok(default);
     }
     bool_from_value(val, name)
+}
+
+/// Parse a raw tx hex and compute the scripthashes of its outputs. Returns
+/// `None` when the hex fails to decode — callers fall back to a full rescan.
+/// Input-side scripthashes are intentionally omitted: looking up prevout
+/// scriptPubKeys here would require chain/mempool access, and the next global
+/// mempool poll covers them anyway via `Mempool::add`.
+fn broadcast_dirty_scripthashes(tx_hex: &str) -> Option<HashSet<FullHash>> {
+    use bitcoin::hex::FromHex;
+    let bytes = Vec::<u8>::from_hex(tx_hex).ok()?;
+    let tx: Transaction = deserialize(&bytes).ok()?;
+    Some(
+        tx.output
+            .iter()
+            .filter(|o| !o.script_pubkey.is_empty())
+            .map(|o| compute_script_hash(&o.script_pubkey))
+            .collect(),
+    )
 }
 
 // TODO: implement caching and delta updates
@@ -368,14 +386,19 @@ impl Connection {
 
     fn blockchain_transaction_broadcast(&self, params: &[Value]) -> Result<Value> {
         let tx = params.get(0).chain_err(|| "missing tx")?;
-        let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
-        let txid = self.query.broadcast_raw(&tx)?;
-        // Force a full subscription rescan after broadcast since we don't
-        // yet know which scripthashes the new tx touches.
-        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate {
-            dirty: Arc::new(HashSet::new()),
-            tip_changed: true,
-        }) {
+        let tx_hex = tx.as_str().chain_err(|| "non-string tx")?.to_string();
+        let txid = self.query.broadcast_raw(&tx_hex)?;
+
+        // Compute output scripthashes from the parsed tx so we can notify
+        // only affected subscriptions rather than forcing a full rescan.
+        // Input scripthashes are covered by the next global mempool-poll
+        // cycle (mempool.add populates dirty_scripthashes for inputs too).
+        // Falls back to a full rescan if parsing fails.
+        let (dirty, tip_changed) = match broadcast_dirty_scripthashes(&tx_hex) {
+            Some(dirty) => (Arc::new(dirty), false),
+            None => (Arc::new(HashSet::new()), true),
+        };
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate { dirty, tip_changed }) {
             warn!("failed to issue PeriodicUpdate after broadcast: {}", e);
         }
         Ok(json!(txid))
@@ -1042,5 +1065,58 @@ mod tests {
             dirty.contains(&lookup_key),
             "scripthash from Sha256dHash must be found in dirty set populated by compute_script_hash"
         );
+    }
+
+    /// Verify that broadcast_dirty_scripthashes parses a tx hex and returns the
+    /// scripthashes of its outputs — and that those match what a subscription
+    /// loop would look up for the same scriptPubKey.
+    #[test]
+    #[cfg(not(feature = "liquid"))]
+    fn broadcast_dirty_scripthashes_outputs() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize_hex;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+        use crate::chain::Transaction as ChainTx;
+
+        let spk1 = Vec::<u8>::from_hex("76a91411111111111111111111111111111111111111111188ac").unwrap();
+        let spk2 = Vec::<u8>::from_hex("76a91422222222222222222222222222222222222222222288ac").unwrap();
+
+        let tx = ChainTx {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: Script::from(spk1.clone()),
+                },
+                TxOut {
+                    value: Amount::from_sat(2),
+                    script_pubkey: Script::from(spk2.clone()),
+                },
+            ],
+        };
+        let tx_hex = serialize_hex(&tx);
+
+        let dirty = broadcast_dirty_scripthashes(&tx_hex).expect("tx should parse");
+        assert_eq!(dirty.len(), 2, "expected one scripthash per output");
+
+        let sh1 = compute_script_hash(&Script::from(spk1));
+        let sh2 = compute_script_hash(&Script::from(spk2));
+        assert!(dirty.contains(&sh1), "missing scripthash for output 0");
+        assert!(dirty.contains(&sh2), "missing scripthash for output 1");
+    }
+
+    /// Malformed hex should return None so the caller falls back to a full rescan.
+    #[test]
+    fn broadcast_dirty_scripthashes_invalid_returns_none() {
+        assert!(broadcast_dirty_scripthashes("not-hex").is_none());
+        assert!(broadcast_dirty_scripthashes("deadbeef").is_none()); // valid hex, not a tx
     }
 }
