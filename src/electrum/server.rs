@@ -97,7 +97,12 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
 /// to `Connection` state after parallel execution completes.
 enum CommandSideEffect {
     SubscribeScriptHash(Sha256dHash, Value),
-    UnsubscribeScriptHash(Sha256dHash),
+    /// Unsubscribe request; carries the JSON-RPC id so `apply_side_effect` can
+    /// rebuild the reply from the actual removal outcome rather than a pre-check.
+    UnsubscribeScriptHash {
+        script_hash: Sha256dHash,
+        id: Value,
+    },
     SubscribeHeaders(HeaderEntry),
 }
 
@@ -302,12 +307,23 @@ impl Connection {
         Ok((status_hash.clone(), Some(CommandSideEffect::SubscribeScriptHash(script_hash, status_hash))))
     }
 
-    fn blockchain_scripthash_unsubscribe_pure(&self, params: &[Value]) -> Result<(Value, Option<CommandSideEffect>)> {
+    fn blockchain_scripthash_unsubscribe_pure(
+        &self,
+        params: &[Value],
+        id: &Value,
+    ) -> Result<(Value, Option<CommandSideEffect>)> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
-        // Return true optimistically; apply_side_effect will check actual presence.
-        // The result is correct for the common case (unsubscribing something that exists).
-        let was_subscribed = self.status_hashes.contains_key(&script_hash);
-        Ok((json!(was_subscribed), Some(CommandSideEffect::UnsubscribeScriptHash(script_hash))))
+        // The reply is produced by apply_side_effect based on the actual removal
+        // outcome. The placeholder below is always replaced — this keeps batch
+        // semantics correct when the same scripthash is unsubscribed more than
+        // once in a single batch.
+        Ok((
+            Value::Null,
+            Some(CommandSideEffect::UnsubscribeScriptHash {
+                script_hash,
+                id: id.clone(),
+            }),
+        ))
     }
 
     #[cfg(not(feature = "liquid"))]
@@ -434,20 +450,28 @@ impl Connection {
         }))
     }
 
-    fn apply_side_effect(&mut self, effect: CommandSideEffect) {
+    /// Apply a collected side effect. If the handler needs the real mutation
+    /// outcome (e.g. unsubscribe returns whether the key was actually present),
+    /// it returns a fully-formed JSON-RPC reply that replaces the placeholder
+    /// from `handle_command_pure`. Otherwise returns `None`.
+    fn apply_side_effect(&mut self, effect: CommandSideEffect) -> Option<Value> {
         match effect {
             CommandSideEffect::SubscribeScriptHash(script_hash, status_hash) => {
                 if self.status_hashes.insert(script_hash, status_hash).is_none() {
                     self.stats.subscriptions.inc();
                 }
+                None
             }
-            CommandSideEffect::UnsubscribeScriptHash(script_hash) => {
-                if self.status_hashes.remove(&script_hash).is_some() {
+            CommandSideEffect::UnsubscribeScriptHash { script_hash, id } => {
+                let actually_removed = self.status_hashes.remove(&script_hash).is_some();
+                if actually_removed {
                     self.stats.subscriptions.dec();
                 }
+                Some(json!({"jsonrpc": "2.0", "id": id, "result": actually_removed}))
             }
             CommandSideEffect::SubscribeHeaders(entry) => {
                 self.last_header_entry = Some(entry);
+                None
             }
         }
     }
@@ -473,7 +497,7 @@ impl Connection {
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(params).map(|v| (v, None)),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(params).map(|v| (v, None)),
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe_pure(params),
-            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe_pure(params),
+            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe_pure(params, id),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(params).map(|v| (v, None)),
             "blockchain.transaction.get" => self.blockchain_transaction_get(params).map(|v| (v, None)),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(params).map(|v| (v, None)),
@@ -512,9 +536,10 @@ impl Connection {
     #[trace(method = %method)]
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let (response, side_effect) = self.handle_command_pure(method, params, id)?;
-        if let Some(effect) = side_effect {
-            self.apply_side_effect(effect);
-        }
+        let response = match side_effect {
+            Some(effect) => self.apply_side_effect(effect).unwrap_or(response),
+            None => response,
+        };
         Ok(response)
     }
 
@@ -617,9 +642,11 @@ impl Connection {
 
                         let mut replies = Vec::with_capacity(results.len());
                         for item in results {
-                            let (reply, side_effect, log_entry) = item?;
+                            let (mut reply, side_effect, log_entry) = item?;
                             if let Some(effect) = side_effect {
-                                self.apply_side_effect(effect);
+                                if let Some(replacement) = self.apply_side_effect(effect) {
+                                    reply = replacement;
+                                }
                             }
                             if let Some(log) = log_entry {
                                 self.log_rpc_event(log);
