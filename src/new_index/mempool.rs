@@ -42,6 +42,11 @@ pub struct Mempool {
     recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
     backlog_stats: (BacklogStats, Instant),
 
+    /// Scripthashes whose mempool history changed since the last drain.
+    /// Accumulated during add() and remove(), drained by the main loop
+    /// to inform Electrum connections which subscriptions need rechecking.
+    dirty_scripthashes: HashSet<FullHash>,
+
     // monitoring
     latency: HistogramVec, // mempool requests latency
     delta: HistogramVec,   // # of added/removed txs
@@ -77,6 +82,7 @@ impl Mempool {
             history: HashMap::new(),
             edges: HashMap::new(),
             recent: ArrayDeque::new(),
+            dirty_scripthashes: HashSet::new(),
             backlog_stats: (
                 BacklogStats::default(),
                 Instant::now() - Duration::from_secs(BACKLOG_STATS_TTL),
@@ -103,6 +109,11 @@ impl Mempool {
 
     pub fn network(&self) -> Network {
         self.config.network_type
+    }
+
+    /// Take and return all scripthashes dirtied since the last drain.
+    pub fn drain_dirty_scripthashes(&mut self) -> HashSet<FullHash> {
+        std::mem::take(&mut self.dirty_scripthashes)
     }
 
     pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
@@ -423,6 +434,7 @@ impl Mempool {
             }
             tx_scripthashes.sort_unstable();
             tx_scripthashes.dedup();
+            self.dirty_scripthashes.extend(tx_scripthashes.iter());
             self.tx_scripthashes.insert(txid, tx_scripthashes);
             for (i, txi) in tx.input.iter().enumerate() {
                 self.edges.insert(txi.previous_output, (txid, i as u32));
@@ -491,6 +503,7 @@ impl Mempool {
                 .tx_scripthashes
                 .remove(*txid)
                 .unwrap_or_else(|| panic!("missing tx_scripthashes for {}", txid));
+            self.dirty_scripthashes.extend(scripthashes.iter());
             prune_history_entries(&mut self.history, &scripthashes, txid);
 
             for txin in tx.input {

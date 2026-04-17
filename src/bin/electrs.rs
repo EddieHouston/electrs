@@ -147,7 +147,8 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
 
         // Index new blocks
         let current_tip = daemon.getbestblockhash()?;
-        if current_tip != tip {
+        let tip_changed = current_tip != tip;
+        if tip_changed {
             tip = indexer.update(&daemon)?;
         };
 
@@ -156,8 +157,11 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
             warn!("skipped failed mempool update, trying again in 5 seconds");
         }
 
+        // Drain scripthashes dirtied by mempool add/remove since last cycle
+        let dirty = mempool.write().unwrap().drain_dirty_scripthashes();
+
         // Update subscribed clients
-        electrum_server.notify();
+        electrum_server.notify(dirty, tip_changed);
     }
     info!("server stopped");
     Ok(())

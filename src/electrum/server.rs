@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -26,7 +26,7 @@ use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
-use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
+use crate::util::{create_socket, full_hash, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
@@ -370,7 +370,12 @@ impl Connection {
         let tx = params.get(0).chain_err(|| "missing tx")?;
         let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
         let txid = self.query.broadcast_raw(&tx)?;
-        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
+        // Force a full subscription rescan after broadcast since we don't
+        // yet know which scripthashes the new tx touches.
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate {
+            dirty: Arc::new(HashSet::new()),
+            tip_changed: true,
+        }) {
             warn!("failed to issue PeriodicUpdate after broadcast: {}", e);
         }
         Ok(json!(txid))
@@ -491,7 +496,11 @@ impl Connection {
     }
 
     #[trace]
-    fn update_subscriptions(&mut self) -> Result<Vec<Value>> {
+    fn update_subscriptions(
+        &mut self,
+        dirty: &HashSet<FullHash>,
+        tip_changed: bool,
+    ) -> Result<Vec<Value>> {
         let timer = self
             .stats
             .latency
@@ -510,7 +519,21 @@ impl Connection {
                     "params": [header]}));
             }
         }
+
+        // Skip scripthash rescans when nothing changed. If the chain tip
+        // advanced we must recheck everything (confirmed history may have
+        // changed). Otherwise only rescan scripthashes dirtied by mempool
+        // activity.
+        if !tip_changed && dirty.is_empty() {
+            timer.observe_duration();
+            return Ok(result);
+        }
+
         for (script_hash, status_hash) in self.status_hashes.iter_mut() {
+            let scripthash_bytes: FullHash = full_hash(&script_hash[..]);
+            if !tip_changed && !dirty.contains(&scripthash_bytes) {
+                continue;
+            }
             let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
             let new_status_hash = get_status_hash(history_txids, &self.query)
                 .map_or(Value::Null, |h| json!(h.to_lower_hex_string()));
@@ -590,9 +613,9 @@ impl Connection {
                         self.send_values(&[reply])?
                     }
                 }
-                Message::PeriodicUpdate => {
+                Message::PeriodicUpdate { dirty, tip_changed } => {
                     let values = self
-                        .update_subscriptions()
+                        .update_subscriptions(&dirty, tip_changed)
                         .chain_err(|| "failed to update subscriptions")?;
                     self.send_values(&values)?
                 }
@@ -722,15 +745,27 @@ struct GetHistoryResult {
     fee: Option<u64>,
 }
 
+/// Scripthashes whose mempool state changed since the last update cycle,
+/// shared across all connections via `Arc` to avoid cloning the set.
+pub type DirtyScriptHashes = Arc<HashSet<FullHash>>;
+
 #[derive(Debug)]
 pub enum Message {
     Request(String),
-    PeriodicUpdate,
+    /// Periodic subscription check. Contains the set of scripthashes dirtied
+    /// by mempool changes and whether the chain tip advanced (new block).
+    PeriodicUpdate {
+        dirty: DirtyScriptHashes,
+        tip_changed: bool,
+    },
     Done,
 }
 
 pub enum Notification {
-    Periodic,
+    Periodic {
+        dirty: DirtyScriptHashes,
+        tip_changed: bool,
+    },
     Exit,
 }
 
@@ -755,10 +790,13 @@ impl RPC {
             for msg in notification.receiver().iter() {
                 let mut senders = senders.lock().unwrap();
                 match msg {
-                    Notification::Periodic => {
+                    Notification::Periodic { dirty, tip_changed } => {
                         senders.retain(|sender| {
                             if let Err(TrySendError::Disconnected(_)) =
-                                sender.try_send(Message::PeriodicUpdate)
+                                sender.try_send(Message::PeriodicUpdate {
+                                    dirty: Arc::clone(&dirty),
+                                    tip_changed,
+                                })
                             {
                                 false // drop disconnected clients
                             } else {
@@ -917,8 +955,13 @@ impl RPC {
         }
     }
 
-    pub fn notify(&self) {
-        self.notification.send(Notification::Periodic).unwrap();
+    pub fn notify(&self, dirty: HashSet<FullHash>, tip_changed: bool) {
+        self.notification
+            .send(Notification::Periodic {
+                dirty: Arc::new(dirty),
+                tip_changed,
+            })
+            .unwrap();
     }
 }
 
@@ -930,5 +973,74 @@ impl Drop for RPC {
             handle.join().unwrap();
         }
         trace!("RPC server is stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hex::FromHex;
+    use crate::new_index::compute_script_hash;
+    use crate::chain::Script;
+
+    /// Verify that converting a Sha256dHash (from Electrum protocol hex) to
+    /// FullHash via full_hash() produces the same bytes as compute_script_hash()
+    /// for the same script. A mismatch here would cause the dirty-scripthash
+    /// lookup in update_subscriptions to silently fail.
+    #[test]
+    fn scripthash_byte_order_roundtrip() {
+        // A simple P2PKH scriptPubKey (OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG)
+        let script_bytes = Vec::<u8>::from_hex("76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac").unwrap();
+        let script = Script::from(script_bytes.clone());
+
+        // Path 1: compute_script_hash (used by mempool dirty tracking)
+        let from_compute = compute_script_hash(&script);
+
+        // Path 2: Electrum protocol hex → Sha256dHash → full_hash
+        // The Electrum protocol sends the scripthash as reversed hex (display order).
+        // Sha256dHash::from_str parses display hex and reverses to internal order.
+        let display_hex: String = from_compute
+            .iter()
+            .rev()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let parsed: Sha256dHash = display_hex.parse().expect("valid hex");
+        let from_parsed = full_hash(&parsed[..]);
+
+        assert_eq!(
+            from_compute, from_parsed,
+            "compute_script_hash and Sha256dHash→full_hash must produce identical bytes"
+        );
+    }
+
+    /// Verify that full_hash conversion is consistent for a known test vector.
+    /// The Electrum protocol sends scripthashes with reversed byte order compared
+    /// to internal storage. This test ensures the conversion in
+    /// update_subscriptions matches what the mempool dirty set contains.
+    #[test]
+    fn scripthash_dirty_set_membership() {
+        let script_bytes = Vec::<u8>::from_hex("76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac").unwrap();
+        let script = Script::from(script_bytes);
+
+        let computed = compute_script_hash(&script);
+
+        // Simulate the dirty set (populated by mempool via compute_script_hash)
+        let mut dirty: HashSet<FullHash> = HashSet::new();
+        dirty.insert(computed);
+
+        // Simulate the lookup path in update_subscriptions:
+        // Sha256dHash key from status_hashes → full_hash → dirty.contains()
+        let display_hex: String = computed
+            .iter()
+            .rev()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let script_hash: Sha256dHash = display_hex.parse().unwrap();
+        let lookup_key = full_hash(&script_hash[..]);
+
+        assert!(
+            dirty.contains(&lookup_key),
+            "scripthash from Sha256dHash must be found in dirty set populated by compute_script_hash"
+        );
     }
 }
