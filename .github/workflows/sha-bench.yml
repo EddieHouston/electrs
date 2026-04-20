@@ -1,0 +1,31 @@
+name: SHA-256 bench (one-shot)
+
+on:
+  push:
+    branches:
+      - bench/sha256-comparison
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU info
+        run: |
+          echo '--- model ---'
+          grep -m1 'model name' /proc/cpuinfo
+          echo '--- SHA-NI flags ---'
+          grep -m1 -oE 'sha_ni|sha1|sha2' /proc/cpuinfo || echo 'NONE'
+          echo '--- flags (full) ---'
+          grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E 'sha|sse|avx' | sort -u
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run bench
+        run: cargo bench --bench sha256_variants 2>&1 | tee bench.out
+
+      - name: Summary
+        run: grep -E 'time:|^status_hash_' bench.out
