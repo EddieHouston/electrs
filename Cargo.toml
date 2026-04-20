@@ -85,11 +85,18 @@ ureq = { version = "3.1", default-features = false, features = ["json"] }
 tempfile = "3.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 bitcoin-test-data = { version = "*" }
+# Only used by benches/sha256_variants.rs to compare against the old (pre-PR)
+# SHA-256 implementation. Not used by production code.
+rust-crypto = "0.2"
 
 [[bench]]
 name = "benches"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "sha256_variants"
+harness = false
 
 
 [profile.release]
