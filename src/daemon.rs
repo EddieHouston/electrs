@@ -708,11 +708,50 @@ impl Daemon {
 
     #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
-        let txid = self.request("sendrawtransaction", json!([txhex]))?;
-        Ok(
-            Txid::from_str(txid.as_str().chain_err(|| "non-string txid")?)
-                .chain_err(|| "failed to parse txid")?,
-        )
+        match self.request("sendrawtransaction", json!([txhex])) {
+            Ok(txid) => Ok(Txid::from_str(txid.as_str().chain_err(|| "non-string txid")?)
+                .chain_err(|| "failed to parse txid")?),
+            Err(e) => {
+                if let Error(ErrorKind::RpcError(-25, ref msg, _), _) = e {
+                    // -25: bad-txns-inputs-missingorspent — call gettxout on every input
+                    // immediately to capture UTXO state before the next block arrives
+                    warn!("sendrawtransaction rejected: rpc_error='{}'", msg);
+                    if let Ok(tx) = deserialize_hex::<Transaction>(txhex) {
+                        for input in &tx.input {
+                            let txid = input.previous_output.txid;
+                            let vout = input.previous_output.vout;
+                            let onchain = self.request("gettxout", json!([txid, vout, false])).ok();
+                            let with_mempool = self.request("gettxout", json!([txid, vout, true])).ok();
+                            let onchain_status = match &onchain {
+                                None => "rpc_error",
+                                Some(v) if v.is_null() => "null",
+                                Some(_) => "present",
+                            };
+                            let mempool_status = match &with_mempool {
+                                None => "rpc_error",
+                                Some(v) if v.is_null() => "null",
+                                Some(_) => "present",
+                            };
+                            warn!(
+                                "gettxout diagnostic: input_txid='{}' input_vout='{}' onchain='{}' with_mempool='{}'",
+                                txid, vout, onchain_status, mempool_status,
+                            );
+                            if let Some(utxo) = with_mempool.as_ref().filter(|v| !v.is_null()) {
+                                warn!("gettxout detail: input_txid='{}' input_vout='{}' utxo='{}'", txid, vout, utxo);
+                            }
+                        }
+                    }
+                } else if let Error(ErrorKind::RpcError(-26, ref msg, _), _) = e {
+                    // -26: txn-mempool-conflict — a mempool tx already spends one of these inputs
+                    warn!(
+                        "sendrawtransaction mempool conflict: rpc_error='{}' txhex_prefix='{}'",
+                        msg,
+                        &txhex[..txhex.len().min(64)],
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn submit_package(

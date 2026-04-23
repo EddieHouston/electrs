@@ -480,6 +480,56 @@ fn test_rest_broadcast_tx() -> Result<()> {
 }
 
 #[test]
+fn test_broadcast_missing_input_logs_diagnostic() -> Result<()> {
+    let (rest_handle, rest_addr, _tester) = common::init_rest_tester().unwrap();
+
+    // Construct a transaction spending a non-existent UTXO (all-zeros txid, vout 0).
+    // Bitcoin Core returns -25 (bad-txns-inputs-missingorspent) because HaveCoin()
+    // finds nothing in the chainstate. This exercises the gettxout diagnostic logging
+    // added to broadcast_raw without needing wallet access or a real UTXO.
+    use bitcoin::hashes::Hash;
+    let fake_tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: bitcoin::Txid::all_zeros(),
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(50_000),
+            script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(
+                &bitcoin::WPubkeyHash::from_raw_hash(
+                    bitcoin::hashes::hash160::Hash::all_zeros(),
+                ),
+            ),
+        }],
+    };
+    let tx_hex = bitcoin::consensus::encode::serialize_hex(&fake_tx);
+
+    let resp = ureq::post(&format!("http://{}/tx", rest_addr))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send(&tx_hex)?;
+
+    assert_eq!(resp.status(), 400);
+    let body = resp.into_body().read_to_string()?;
+    assert!(
+        body.contains("-25"),
+        "expected -25 missing-inputs error, got: {}",
+        body
+    );
+
+    rest_handle.stop();
+    Ok(())
+}
+
+#[test]
 fn test_rest_package_validation() -> Result<()> {
     let (rest_handle, rest_addr, _tester) = common::init_rest_tester().unwrap();
 
