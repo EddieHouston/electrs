@@ -713,31 +713,81 @@ impl Daemon {
                 .chain_err(|| "failed to parse txid")?),
             Err(e) => {
                 if let Error(ErrorKind::RpcError(-25, ref msg, _), _) = e {
-                    // -25: bad-txns-inputs-missingorspent — call gettxout on every input
-                    // immediately to capture UTXO state before the next block arrives
-                    warn!("sendrawtransaction rejected: rpc_error='{}'", msg);
+                    // -25: bad-txns-inputs-missingorspent
+                    // Capture node identity + chain tip, then gettxout state twice
+                    // (250ms apart) to distinguish durable UTXO absence from a
+                    // transient race inside bitcoind's coins cache.
+                    let backend_host = std::env::var("HOSTNAME")
+                        .or_else(|_| {
+                            std::fs::read_to_string("/etc/hostname")
+                                .map(|s| s.trim().to_string())
+                        })
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    let blockchain_info = self.request("getblockchaininfo", json!([])).ok();
+                    let tip_height = blockchain_info
+                        .as_ref()
+                        .and_then(|bi| bi.get("blocks").and_then(|v| v.as_u64()))
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let tip_hash = blockchain_info
+                        .as_ref()
+                        .and_then(|bi| bi.get("bestblockhash").and_then(|v| v.as_str()))
+                        .unwrap_or("unknown")
+                        .to_string();
+                    warn!(
+                        "sendrawtransaction rejected: rpc_error='{}' backend_host='{}' tip_height='{}' tip_hash='{}'",
+                        msg, backend_host, tip_height, tip_hash,
+                    );
                     if let Ok(tx) = deserialize_hex::<Transaction>(txhex) {
-                        for input in &tx.input {
-                            let txid = input.previous_output.txid;
-                            let vout = input.previous_output.vout;
-                            let onchain = self.request("gettxout", json!([txid, vout, false])).ok();
-                            let with_mempool = self.request("gettxout", json!([txid, vout, true])).ok();
-                            let onchain_status = match &onchain {
-                                None => "rpc_error",
-                                Some(v) if v.is_null() => "null",
-                                Some(_) => "present",
-                            };
-                            let mempool_status = match &with_mempool {
+                        // First round: capture t0 gettxout for every input
+                        let t0: Vec<(Txid, u32, Option<Value>, Option<Value>)> = tx
+                            .input
+                            .iter()
+                            .map(|input| {
+                                let txid = input.previous_output.txid;
+                                let vout = input.previous_output.vout;
+                                let onchain = self.request("gettxout", json!([txid, vout, false])).ok();
+                                let with_mempool = self.request("gettxout", json!([txid, vout, true])).ok();
+                                (txid, vout, onchain, with_mempool)
+                            })
+                            .collect();
+
+                        // Wait 250ms so any transient race inside bitcoind has time to resolve
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+
+                        // Second round: re-query the same inputs
+                        for (txid, vout, t0_onchain, t0_with_mempool) in t0 {
+                            let t1_onchain = self.request("gettxout", json!([txid, vout, false])).ok();
+                            let t1_with_mempool = self.request("gettxout", json!([txid, vout, true])).ok();
+                            let status = |r: &Option<Value>| match r {
                                 None => "rpc_error",
                                 Some(v) if v.is_null() => "null",
                                 Some(_) => "present",
                             };
                             warn!(
-                                "gettxout diagnostic: input_txid='{}' input_vout='{}' onchain='{}' with_mempool='{}'",
-                                txid, vout, onchain_status, mempool_status,
+                                "gettxout diagnostic: input_txid='{}' input_vout='{}' t0_onchain='{}' t0_with_mempool='{}' t1_onchain='{}' t1_with_mempool='{}'",
+                                txid,
+                                vout,
+                                status(&t0_onchain),
+                                status(&t0_with_mempool),
+                                status(&t1_onchain),
+                                status(&t1_with_mempool),
                             );
-                            if let Some(utxo) = with_mempool.as_ref().filter(|v| !v.is_null()) {
-                                warn!("gettxout detail: input_txid='{}' input_vout='{}' utxo='{}'", txid, vout, utxo);
+                            let detail = t1_with_mempool
+                                .as_ref()
+                                .filter(|v| !v.is_null())
+                                .map(|v| ("t1", v))
+                                .or_else(|| {
+                                    t0_with_mempool
+                                        .as_ref()
+                                        .filter(|v| !v.is_null())
+                                        .map(|v| ("t0", v))
+                                });
+                            if let Some((source, utxo)) = detail {
+                                warn!(
+                                    "gettxout detail: input_txid='{}' input_vout='{}' source='{}' utxo='{}'",
+                                    txid, vout, source, utxo,
+                                );
                             }
                         }
                     }
