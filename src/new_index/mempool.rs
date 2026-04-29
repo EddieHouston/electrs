@@ -309,7 +309,7 @@ impl Mempool {
             if let Ok(tx) = daemon.getmempooltx(&txid) {
                 let mut txs_map = HashMap::new();
                 txs_map.insert(txid, tx);
-                self.add(txs_map)
+                self.add(txs_map).map(|_| ())
             } else {
                 bail!("add_by_txid cannot find {}", txid);
             }
@@ -319,11 +319,12 @@ impl Mempool {
     }
 
     #[trace]
-    fn add(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<()> {
+    fn add(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<HashSet<FullHash>> {
         self.delta
             .with_label_values(&["add"])
             .observe(txs_map.len() as f64);
         let _timer = self.latency.with_label_values(&["add"]).start_timer();
+        let mut affected_scripts = HashSet::new();
 
         let spent_prevouts = get_prev_outpoints(txs_map.values());
 
@@ -410,6 +411,7 @@ impl Mempool {
 
             // Index funding/spending history entries and spend edges
             for (scripthash, entry) in funding.chain(spending) {
+                affected_scripts.insert(scripthash);
                 self.history
                     .entry(scripthash)
                     .or_insert_with(Vec::new)
@@ -430,7 +432,7 @@ impl Mempool {
             );
         }
 
-        Ok(())
+        Ok(affected_scripts)
     }
 
     fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
@@ -462,11 +464,12 @@ impl Mempool {
     }
 
     #[trace]
-    fn remove(&mut self, to_remove: HashSet<&Txid>) {
+    fn remove(&mut self, to_remove: HashSet<&Txid>) -> HashSet<FullHash> {
         self.delta
             .with_label_values(&["remove"])
             .observe(to_remove.len() as f64);
         let _timer = self.latency.with_label_values(&["remove"]).start_timer();
+        let mut affected_scripts = HashSet::new();
 
         for txid in &to_remove {
             self.txstore
@@ -480,8 +483,12 @@ impl Mempool {
         }
 
         // TODO: make it more efficient (currently it takes O(|mempool|) time)
-        self.history.retain(|_scripthash, entries| {
+        self.history.retain(|scripthash, entries| {
+            let before = entries.len();
             entries.retain(|entry| !to_remove.contains(&entry.get_txid()));
+            if entries.len() != before {
+                affected_scripts.insert(*scripthash);
+            }
             !entries.is_empty()
         });
 
@@ -494,6 +501,8 @@ impl Mempool {
 
         self.edges
             .retain(|_outpoint, (txid, _vin)| !to_remove.contains(txid));
+
+        affected_scripts
     }
 
     #[cfg(feature = "liquid")]
@@ -515,12 +524,13 @@ impl Mempool {
         mempool: &Arc<RwLock<Mempool>>,
         daemon: &Daemon,
         tip: &BlockHash,
-    ) -> Result<bool> {
+    ) -> Result<(bool, HashSet<FullHash>)> {
         let (_timer, count) = {
             let mempool = mempool.read().unwrap();
             let timer = mempool.latency.with_label_values(&["update"]).start_timer();
             (timer, mempool.count.clone())
         };
+        let mut affected_scripts = HashSet::new();
 
         // Get bitcoind's current list of mempool txids
         let bitcoind_txids = daemon
@@ -535,7 +545,7 @@ impl Mempool {
             .difference(&bitcoind_txids)
             .collect::<HashSet<_>>();
         if !evicted_txids.is_empty() {
-            mempool.write().unwrap().remove(evicted_txids);
+            affected_scripts.extend(mempool.write().unwrap().remove(evicted_txids));
         } // avoids acquiring a lock when there are no evictions
 
         // Find transactions available in bitcoind's mempool but not indexed locally
@@ -560,7 +570,7 @@ impl Mempool {
             .set(new_txids.len() as f64);
 
         if new_txids.is_empty() {
-            return Ok(true);
+            return Ok((true, affected_scripts));
         }
 
         // Fetch missing transactions from bitcoind
@@ -569,7 +579,7 @@ impl Mempool {
         // Abort if the chain tip moved while fetching transactions
         if daemon.getbestblockhash()? != *tip {
             warn!("chain tip moved while updating mempool");
-            return Ok(false);
+            return Ok((false, affected_scripts));
         }
 
         // Find which transactions were requested but are no longer available in bitcoind's mempool,
@@ -619,7 +629,7 @@ impl Mempool {
         if !fetched_txs.is_empty() {
             let mut mempool = mempool.write().unwrap();
 
-            mempool.add(fetched_txs)?;
+            affected_scripts.extend(mempool.add(fetched_txs)?);
 
             count
                 .with_label_values(&["txs"])
@@ -633,7 +643,7 @@ impl Mempool {
 
         trace!("mempool is synced");
 
-        Ok(true)
+        Ok((true, affected_scripts))
     }
 }
 

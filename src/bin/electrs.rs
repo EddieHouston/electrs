@@ -96,7 +96,7 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         Arc::clone(&config),
     )));
 
-    while !Mempool::update(&mempool, &daemon, &tip)? {
+    while !Mempool::update(&mempool, &daemon, &tip)?.0 {
         // Mempool syncing was aborted because the chain tip moved;
         // Index the new block(s) and try again.
         tip = indexer.update(&daemon)?;
@@ -144,17 +144,23 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
 
         // Index new blocks
         let current_tip = daemon.getbestblockhash()?;
-        if current_tip != tip {
+        let chain_changed = current_tip != tip;
+        if chain_changed {
             tip = indexer.update(&daemon)?;
         };
 
         // Update mempool
-        if !Mempool::update(&mempool, &daemon, &tip)? {
+        let (mempool_synced, affected_scripts) = Mempool::update(&mempool, &daemon, &tip)?;
+        if !mempool_synced {
             warn!("skipped failed mempool update, trying again in 5 seconds");
         }
 
         // Update subscribed clients
-        electrum_server.notify();
+        if chain_changed || !mempool_synced {
+            electrum_server.notify();
+        } else {
+            electrum_server.notify_scripts(affected_scripts);
+        }
     }
     info!("server stopped");
     Ok(())

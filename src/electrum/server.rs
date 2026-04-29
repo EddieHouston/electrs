@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -26,7 +26,9 @@ use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
-use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
+use crate::util::{
+    create_socket, full_hash, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry,
+};
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
@@ -370,7 +372,7 @@ impl Connection {
         let tx = params.get(0).chain_err(|| "missing tx")?;
         let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
         let txid = self.query.broadcast_raw(&tx)?;
-        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate(None)) {
             warn!("failed to issue PeriodicUpdate after broadcast: {}", e);
         }
         Ok(json!(txid))
@@ -491,7 +493,7 @@ impl Connection {
     }
 
     #[trace]
-    fn update_subscriptions(&mut self) -> Result<Vec<Value>> {
+    fn update_subscriptions(&mut self, only: Option<&HashSet<FullHash>>) -> Result<Vec<Value>> {
         let timer = self
             .stats
             .latency
@@ -511,6 +513,11 @@ impl Connection {
             }
         }
         for (script_hash, status_hash) in self.status_hashes.iter_mut() {
+            if let Some(only) = only {
+                if !only.contains(&full_hash(&script_hash[..])) {
+                    continue;
+                }
+            }
             let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
             let new_status_hash = get_status_hash(history_txids, &self.query)
                 .map_or(Value::Null, |h| json!(h.to_lower_hex_string()));
@@ -590,9 +597,9 @@ impl Connection {
                         self.send_values(&[reply])?
                     }
                 }
-                Message::PeriodicUpdate => {
+                Message::PeriodicUpdate(only) => {
                     let values = self
-                        .update_subscriptions()
+                        .update_subscriptions(only.as_deref())
                         .chain_err(|| "failed to update subscriptions")?;
                     self.send_values(&values)?
                 }
@@ -725,12 +732,12 @@ struct GetHistoryResult {
 #[derive(Debug)]
 pub enum Message {
     Request(String),
-    PeriodicUpdate,
+    PeriodicUpdate(Option<Arc<HashSet<FullHash>>>),
     Done,
 }
 
 pub enum Notification {
-    Periodic,
+    Periodic(Option<Arc<HashSet<FullHash>>>),
     Exit,
 }
 
@@ -755,10 +762,10 @@ impl RPC {
             for msg in notification.receiver().iter() {
                 let mut senders = senders.lock().unwrap();
                 match msg {
-                    Notification::Periodic => {
+                    Notification::Periodic(affected) => {
                         senders.retain(|sender| {
                             if let Err(TrySendError::Disconnected(_)) =
-                                sender.try_send(Message::PeriodicUpdate)
+                                sender.try_send(Message::PeriodicUpdate(affected.clone()))
                             {
                                 false // drop disconnected clients
                             } else {
@@ -918,7 +925,16 @@ impl RPC {
     }
 
     pub fn notify(&self) {
-        self.notification.send(Notification::Periodic).unwrap();
+        self.notification.send(Notification::Periodic(None)).unwrap();
+    }
+
+    pub fn notify_scripts(&self, affected: HashSet<FullHash>) {
+        if affected.is_empty() {
+            return;
+        }
+        self.notification
+            .send(Notification::Periodic(Some(Arc::new(affected))))
+            .unwrap();
     }
 }
 
