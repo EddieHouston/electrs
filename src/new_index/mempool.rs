@@ -303,8 +303,35 @@ impl Mempool {
             .latency
             .with_label_values(&["update_backlog_stats"])
             .start_timer();
-        let feeinfo: Vec<&TxFeeInfo> = self.feeinfo.values().collect();
-        self.backlog_stats = (BacklogStats::from_feeinfo_slice(&feeinfo), Instant::now());
+        let parents = self.mempool_parents();
+        self.backlog_stats = (
+            BacklogStats::new(&self.feeinfo, &parents),
+            Instant::now(),
+        );
+    }
+
+    /// Map each mempool txid to the list of its in-mempool parents (the txids
+    /// whose outputs it spends that are themselves still unconfirmed). Used to
+    /// compute the CPFP/package-aware fee histogram. Txids with no in-mempool
+    /// ancestry are omitted.
+    fn mempool_parents(&self) -> HashMap<Txid, Vec<Txid>> {
+        let mut parents = HashMap::new();
+        for (txid, tx) in &self.txstore {
+            let mut tx_parents: Vec<Txid> = tx
+                .input
+                .iter()
+                .map(|txi| txi.previous_output.txid)
+                .filter(|prev_txid| self.txstore.contains_key(prev_txid))
+                .collect();
+            if tx_parents.is_empty() {
+                continue;
+            }
+            // A tx may spend multiple outputs of the same parent.
+            tx_parents.sort_unstable();
+            tx_parents.dedup();
+            parents.insert(*txid, tx_parents);
+        }
+        parents
     }
 
     #[trace]
@@ -698,17 +725,19 @@ impl BacklogStats {
     }
 
     #[trace]
-    fn from_feeinfo_slice(fees: &[&TxFeeInfo]) -> Self {
+    fn new(feeinfo: &HashMap<Txid, TxFeeInfo>, parents: &HashMap<Txid, Vec<Txid>>) -> Self {
         let (count, vsize, total_fee) =
-            fees.iter().fold((0, 0, 0), |(count, vsize, fee), feeinfo| {
-                (count + 1, vsize + feeinfo.vsize, fee + feeinfo.fee)
-            });
+            feeinfo
+                .values()
+                .fold((0u32, 0u64, 0u64), |(count, vsize, fee), feeinfo| {
+                    (count + 1, vsize + feeinfo.vsize, fee + feeinfo.fee)
+                });
 
         BacklogStats {
             count,
             vsize,
             total_fee,
-            fee_histogram: make_fee_histogram(fees.iter().copied().collect()),
+            fee_histogram: make_fee_histogram(feeinfo, parents),
         }
     }
 }
