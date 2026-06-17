@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 use crate::{chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
 }, new_index::db_metrics::RocksDbMetrics};
-use crate::config::Config;
+use crate::config::{CacheType, Config};
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
@@ -59,14 +59,26 @@ impl Store {
     pub fn open(config: &Config, metrics: &Metrics, verify_compat: bool) -> Self {
         let path = config.db_path.join("newindex");
 
-        // Create a single shared LRU cache for all three DBs. The total size is
-        // --db-block-cache-mb (not multiplied by 3). RocksDB's LRU cache is
+        // Create a single shared block cache for all three DBs. The total size is
+        // --db-block-cache-mb (not multiplied by 3). RocksDB caches are
         // thread-safe, so all DBs share one eviction pool. This lets the
         // txstore (which holds the bulk of the data) claim as much cache as it
         // needs without being artificially capped at 1/3 of the total.
         let cache_size_bytes = config.db_block_cache_mb * 1024 * 1024;
-        let shared_cache = rocksdb::Cache::new_lru_cache(cache_size_bytes);
-        debug!("shared LRU block cache: db_block_cache_mb='{}'", config.db_block_cache_mb);
+        let shared_cache = match config.db_cache_type {
+            CacheType::Lru => rocksdb::Cache::new_lru_cache(cache_size_bytes),
+            CacheType::HyperClock => {
+                // estimated_entry_charge = 0 selects the auto-tuning
+                // AutoHyperClockCache, which adapts to the mixed entry sizes
+                // electrs caches (4 KiB data blocks alongside much larger
+                // index/filter blocks) instead of assuming a single charge.
+                rocksdb::Cache::new_hyper_clock_cache(cache_size_bytes, 0)
+            }
+        };
+        debug!(
+            "shared block cache: type='{:?}' db_block_cache_mb='{}'",
+            config.db_cache_type, config.db_block_cache_mb
+        );
 
         let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());

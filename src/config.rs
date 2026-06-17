@@ -16,6 +16,15 @@ use bitcoin::Network as BNetwork;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Selects which RocksDB block cache implementation to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheType {
+    /// Sharded LRU cache (RocksDB default).
+    Lru,
+    /// Lock-free HyperClockCache; better concurrency under heavy read load.
+    HyperClock,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // See below for the documentation of each field:
@@ -53,6 +62,12 @@ pub struct Config {
     /// a 512 MB write buffer, each L0 file's filter block is ~9.75 MB, so 64 L0
     /// files need ~625 MB of filter blocks on top of index blocks.
     pub db_block_cache_mb: usize,
+
+    /// RocksDB block cache implementation: "lru" (default) or "hyper-clock".
+    /// HyperClockCache is lock-free and scales better under high concurrency,
+    /// avoiding the sharded-mutex contention of the LRU cache. See db.rs for
+    /// the estimated_entry_charge tuning used when this is "hyper-clock".
+    pub db_cache_type: CacheType,
 
     /// RocksDB parallelism level (background compaction and flush threads)
     /// Recommendation: Set to number of CPU cores for optimal performance
@@ -252,6 +267,13 @@ impl Config {
                     .help("RocksDB block cache size in MB (shared across all databases). Bounds index/filter block memory; use 4096+ for initial sync to avoid table-reader heap growth.")
                     .takes_value(true)
                     .default_value("24")
+            ).arg(
+                Arg::with_name("db_cache_type")
+                    .long("db-cache-type")
+                    .help("RocksDB block cache implementation: 'lru' (default) or 'hyper-clock'. HyperClockCache is lock-free and scales better under high read concurrency.")
+                    .takes_value(true)
+                    .possible_values(&["lru", "hyper-clock"])
+                    .default_value("lru")
             ).arg(
                 Arg::with_name("db_parallelism")
                     .long("db-parallelism")
@@ -518,6 +540,10 @@ impl Config {
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
             db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
+            db_cache_type: match m.value_of("db_cache_type") {
+                Some("hyper-clock") => CacheType::HyperClock,
+                _ => CacheType::Lru,
+            },
             db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
             db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             initial_sync_batch_size: value_t_or_exit!(m, "initial_sync_batch_size", usize),
